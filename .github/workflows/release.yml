@@ -1,0 +1,855 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force release even if tag already exists"
+        required: false
+        default: false
+        type: boolean
+      version:
+        description: "Override version (e.g. 0.1.0-hotfix). Leave empty to use Cargo.toml"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_HTTP_MULTIPLEXING: false
+
+jobs:
+  # ── Version gate ──────────────────────────────────────────────────────────
+  check-version:
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      is_new: ${{ steps.check.outputs.is_new }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Check if release already exists
+        id: check
+        run: |
+          OVERRIDE="${{ github.event.inputs.version }}"
+          if [ -n "$OVERRIDE" ]; then
+            VERSION="$OVERRIDE"
+          else
+            VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          fi
+          TAG="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          BASE="https://api.github.com"
+          REPO="${{ github.repository }}"
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          REL=$(curl -sf -H "Authorization: Bearer $TOKEN" "$BASE/repos/$REPO/releases/tags/$TAG" 2>/dev/null || echo "")
+          FORCE="${{ github.event.inputs.force }}"
+          if [ "$FORCE" = "true" ]; then
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
+            echo "⚠ Force-triggered — ignoring existing release."
+          elif [ -n "$REL" ]; then
+            echo "is_new=false" >> "$GITHUB_OUTPUT"
+            echo "✔ Release $TAG already exists — nothing to do."
+          else
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
+            echo "New version $VERSION detected — running full pipeline."
+          fi
+
+  # ── Linux CI ──────────────────────────────────────────────────────────────
+  linux-test:
+    if: github.event_name == 'pull_request' || needs.check-version.outputs.is_new == 'true'
+    needs: [check-version]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile default
+          source "$HOME/.cargo/env"
+          rustup component add clippy
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies (GUI)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libxdo-dev \
+            libxkbcommon-dev \
+            libwayland-dev
+
+      - name: Clippy
+        run: |
+          source "$HOME/.cargo/env"
+          cargo clippy --locked --workspace --all-features -- -D warnings
+
+      - name: Run tests
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test --locked --features gui
+
+  # ── Windows CI ────────────────────────────────────────────────────────────
+  windows-test:
+    if: github.event_name == 'pull_request' || needs.check-version.outputs.is_new == 'true'
+    needs: [check-version]
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        shell: powershell
+        run: |
+          # Download and run the Windows rustup installer non-interactively
+          Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+          .\rustup-init.exe -y --profile minimal
+          # Persist .cargo/bin in PATH for all subsequent steps
+          "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;" + $env:PATH
+          rustc --version
+          cargo --version
+
+      - name: Setup MSVC build environment
+        shell: powershell
+        run: |
+          $vcvars = $null
+          $editions = @('Community', 'Enterprise', 'BuildTools', 'Professional')
+          $years = @('2022', '2019')
+          $baseDirs = @(
+            "${env:ProgramFiles}\Microsoft Visual Studio",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio"
+          )
+          foreach ($base in $baseDirs) {
+            foreach ($year in $years) {
+              foreach ($ed in $editions) {
+                $candidate = "$base\$year\$ed\VC\Auxiliary\Build\vcvars64.bat"
+                if (Test-Path $candidate) {
+                  $vcvars = $candidate
+                  break
+                }
+              }
+              if ($vcvars) { break }
+            }
+            if ($vcvars) { break }
+          }
+          if (-not $vcvars) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path $vswhere) {
+              $vspath = & $vswhere -latest -property installationPath
+              if ($vspath) {
+                $candidate = Join-Path $vspath "VC\Auxiliary\Build\vcvars64.bat"
+                if (Test-Path $candidate) { $vcvars = $candidate }
+              }
+            }
+          }
+          if ($vcvars) {
+            Write-Output "Found vcvars64.bat at: $vcvars"
+            cmd /c "`"$vcvars`" > nul 2>&1 && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)') {
+                $key = $matches[1]
+                $val = $matches[2]
+                if ($key -eq 'PATH') {
+                  $val | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+                } else {
+                  "$key=$val" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+                }
+              }
+            }
+          } else {
+            Write-Output "Warning: vcvars64.bat not found. Cargo may fail without MSVC tools."
+          }
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate WXS installer XML
+        shell: powershell
+        run: |
+          [xml](Get-Content resources/windows/awara.wxs)
+          Write-Output "awara.wxs is valid XML"
+
+      - name: Clippy
+        shell: powershell
+        run: |
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          rustup component add clippy
+          cargo clippy --locked --workspace --all-features -- -D warnings
+
+      - name: Run tests
+        shell: powershell
+        run: |
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          cargo test --locked --all-features
+
+  # ── macOS CI ──────────────────────────────────────────────────────────────
+  macos-test:
+    if: github.event_name == 'pull_request' || needs.check-version.outputs.is_new == 'true'
+    needs: [check-version]
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Clippy
+        run: |
+          rustup component add clippy
+          cargo clippy --locked --workspace --all-features -- -D warnings
+
+      - name: Run tests
+        run: |
+          cargo test --locked --features gui
+
+  # ── Auto-tag ──────────────────────────────────────────────────────────────
+  auto-tag:
+    needs: [check-version, linux-test, windows-test, macos-test]
+    if: needs.check-version.outputs.is_new == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Create tag from Cargo.toml version
+        uses: ./.github/actions/auto-tag
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Release: Linux ────────────────────────────────────────────────────────
+  linux-release:
+    needs: [check-version, linux-test, windows-test, macos-test, auto-tag]
+    if: needs.check-version.outputs.is_new == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Get version
+        id: version
+        uses: ./.github/actions/extract-version
+
+      - name: Install Rust
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies (GUI)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libxdo-dev \
+            libxkbcommon-dev \
+            libwayland-dev
+
+      - name: Build release binary
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --locked --release
+
+      - name: Smoke test (shared libraries)
+        run: |
+          ldd target/release/awara | grep -i 'not found' && { echo "FAIL: missing shared libraries"; exit 1; } || true
+          echo "All shared library dependencies resolved"
+          ./target/release/awara --version
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            rpm \
+            rpm2cpio \
+            cpio \
+            ruby-dev \
+            build-essential \
+            librsvg2-bin
+          sudo gem install --no-document fpm
+
+      - name: Download appimagetool
+        run: |
+          wget -qO appimagetool \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+
+      # ── tarball ──────────────────────────────────────────────────────────
+      - name: Package (tarball)
+        id: package-tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCH=x86_64
+          ASSET="awara-${VERSION}-linux-x64.tar.gz"
+          tar -czf "$ASSET" -C target/release awara
+          echo "ASSET=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (tarball)
+        run: |
+          ASSET="${{ steps.package-tarball.outputs.ASSET }}"
+          testdir="$(mktemp -d)"
+          tar -xzf "$ASSET" -C "$testdir"
+          "$testdir/awara" --version
+          rm -rf "$testdir"
+          echo "✓ tarball passed"
+
+      - name: Publish tarball
+        uses: ./.github/actions/publish-release
+        with:
+          asset: ${{ steps.package-tarball.outputs.ASSET }}
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── deb ──────────────────────────────────────────────────────────────
+      - name: Package (deb)
+        id: package-deb
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ASSET="awara-${VERSION}-linux-x64.deb"
+
+          mkdir -p pkg/DEBIAN pkg/usr/local/bin pkg/usr/share/applications
+
+          cat > pkg/DEBIAN/control <<EOF
+          Package: awara
+          Version: $VERSION
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libgtk-3-0, libxdo3, libxkbcommon0, libwayland-client0
+          Maintainer: Matthew Deik <131482791+mdeik@users.noreply.github.com>
+          Description: Batch file renamer with TUI and optional GUI
+           awara is a batch file renamer with a terminal UI and an optional GUI
+           mode powered by egui.
+           After installation, run: sudo update-desktop-database
+          EOF
+
+          # postinst: register .desktop file so file managers pick up the context menu action
+          cat > pkg/DEBIAN/postinst <<'POSTINST'
+          #!/bin/sh
+          set -e
+          if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database -q /usr/share/applications 2>/dev/null || true
+          fi
+          exit 0
+          POSTINST
+          chmod 755 pkg/DEBIAN/postinst
+
+          cp target/release/awara pkg/usr/local/bin/awara
+          chmod 755 pkg/usr/local/bin/awara
+          cp resources/linux/awara.desktop pkg/usr/share/applications/awara.desktop
+          chmod 644 pkg/usr/share/applications/awara.desktop
+
+          dpkg-deb --build pkg "$ASSET"
+          echo "ASSET=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (deb)
+        run: |
+          ASSET="${{ steps.package-deb.outputs.ASSET }}"
+          testdir="$(mktemp -d)"
+          dpkg-deb --extract "$ASSET" "$testdir"
+          "$testdir/usr/local/bin/awara" --version
+          rm -rf "$testdir"
+          echo "✓ deb passed"
+
+      - name: Publish deb
+        uses: ./.github/actions/publish-release
+        with:
+          asset: ${{ steps.package-deb.outputs.ASSET }}
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── rpm ──────────────────────────────────────────────────────────────
+      - name: Package (rpm)
+        id: package-rpm
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ASSET="awara-${VERSION}-linux-x64.rpm"
+
+          fpm \
+            --input-type dir \
+            --output-type rpm \
+            --name awara \
+            --version "$VERSION" \
+            --architecture x86_64 \
+            --description "Batch file renamer with TUI and optional GUI" \
+            --depends libgtk-3 \
+            --depends libxdo \
+            --depends libxkbcommon \
+            --depends wayland-client \
+            --maintainer "Matthew Deik <131482791+mdeik@users.noreply.github.com>" \
+            --url "https://github.com/${{ github.repository }}" \
+            --after-install <(echo '#!/bin/sh
+          if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database -q /usr/share/applications 2>/dev/null || true
+          fi
+          exit 0') \
+                      --package "$ASSET" \
+                      target/release/awara=/usr/local/bin/awara \
+                      resources/linux/awara.desktop=/usr/share/applications/awara.desktop
+
+                    echo "ASSET=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (rpm)
+        run: |
+          ASSET="${{ steps.package-rpm.outputs.ASSET }}"
+          testdir="$(mktemp -d)"
+          cd "$testdir"
+          rpm2cpio "$OLDPWD/$ASSET" | cpio -idmv 2>/dev/null
+          "$testdir/usr/local/bin/awara" --version
+          rm -rf "$testdir"
+          echo "✓ rpm passed"
+
+      - name: Publish rpm
+        uses: ./.github/actions/publish-release
+        with:
+          asset: ${{ steps.package-rpm.outputs.ASSET }}
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── AppImage ─────────────────────────────────────────────────────────
+      - name: Package (AppImage)
+        id: package-appimage
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCH=x86_64
+
+          mkdir -p AppDir/usr/bin AppDir/usr/lib
+          cp target/release/awara AppDir/usr/bin/awara
+
+          # Bundle shared library dependencies so the AppImage is self-contained
+          ldd AppDir/usr/bin/awara | grep '=> /' | awk '{print $3}' | while IFS= read -r lib; do
+              libname=$(basename "$lib")
+              case "$libname" in
+                  libc.so*|ld-linux*|libdl.so*|librt.so*|libm.so*) ;;
+                  libpthread.so*|libutil.so*|libresolv.so*|libnss*) ;;
+                  libBrokenLocale*|libanl.so*|libthread_db*) ;;
+                  *)  cp -Lf "$lib" "AppDir/usr/lib/" ;;
+              esac
+          done
+
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$APPDIR/usr/bin/awara" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          cp resources/linux/awara.desktop AppDir/awara.desktop
+          # Adjust Exec for AppImage sandbox ($APPDIR/usr/bin/awara)
+          sed -i 's|Exec=awara --gui %F|Exec=awara --gui %F|' AppDir/awara.desktop
+
+          # Generate a PNG icon from the SVG using rsvg-convert
+          if command -v rsvg-convert &>/dev/null; then
+            rsvg-convert -w 256 -h 256 resources/icons/awara.svg -o AppDir/awara.png
+          else
+            # Minimal valid 1x1 PNG as fallback
+            printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82' \
+              > AppDir/awara.png
+          fi
+
+          ARCH=$ARCH ./appimagetool --appimage-extract-and-run AppDir \
+            "awara-${VERSION}-linux-x64.AppImage"
+
+          echo "ASSET=awara-${VERSION}-linux-x64.AppImage" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (AppImage)
+        run: |
+          ASSET="awara-${{ steps.version.outputs.version }}-linux-x64.AppImage"
+          echo "Testing $ASSET ..."
+          ./"$ASSET" --appimage-extract-and-run --version
+
+      - name: Publish AppImage
+        uses: ./.github/actions/publish-release
+        with:
+          asset: ${{ steps.package-appimage.outputs.ASSET }}
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Release: Windows ──────────────────────────────────────────────────────
+  windows-release:
+    needs: [check-version, linux-test, windows-test, macos-test, auto-tag]
+    if: needs.check-version.outputs.is_new == 'true'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Get version
+        id: version
+        uses: ./.github/actions/extract-version
+
+      - name: Install Rust
+        shell: powershell
+        run: |
+          # Download and run the Windows rustup installer non-interactively
+          Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+          .\rustup-init.exe -y --profile minimal
+          # Persist .cargo/bin in PATH for all subsequent steps
+          "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;" + $env:PATH
+          rustc --version
+          cargo --version
+
+      - name: Setup MSVC build environment
+        shell: pwsh
+        run: |
+          $vcvars = $null
+          $editions = @('Community', 'Enterprise', 'BuildTools', 'Professional')
+          $years = @('2022', '2019')
+          $baseDirs = @(
+            "${env:ProgramFiles}\Microsoft Visual Studio",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio"
+          )
+          foreach ($base in $baseDirs) {
+            foreach ($year in $years) {
+              foreach ($ed in $editions) {
+                $candidate = "$base\$year\$ed\VC\Auxiliary\Build\vcvars64.bat"
+                if (Test-Path $candidate) {
+                  $vcvars = $candidate
+                  break
+                }
+              }
+              if ($vcvars) { break }
+            }
+            if ($vcvars) { break }
+          }
+          if (-not $vcvars) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path $vswhere) {
+              $vspath = & $vswhere -latest -property installationPath
+              if ($vspath) {
+                $candidate = Join-Path $vspath "VC\Auxiliary\Build\vcvars64.bat"
+                if (Test-Path $candidate) { $vcvars = $candidate }
+              }
+            }
+          }
+          if ($vcvars) {
+            Write-Output "Found vcvars64.bat at: $vcvars"
+            cmd /c "`"$vcvars`" > nul 2>&1 && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)') {
+                $key = $matches[1]
+                $val = $matches[2]
+                if ($key -eq 'PATH') {
+                  $val | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+                } else {
+                  "$key=$val" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+                }
+              }
+            }
+          } else {
+            Write-Output "Warning: vcvars64.bat not found. Cargo may fail without MSVC tools."
+          }
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          cargo build --locked --release --all-features
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          & .\target\release\awara.exe --version
+          if (-not $?) { throw "awara.exe smoke test failed" }
+
+      - name: Package (zip)
+        id: package
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $asset = "awara-$v-windows-x64.zip"
+          Compress-Archive -Path target\release\awara.exe -DestinationPath $asset
+          echo "ASSET=$asset" >> $env:GITHUB_OUTPUT
+
+      - name: Publish zip
+        uses: ./.github/actions/publish-release
+        with:
+          asset: ${{ steps.package.outputs.ASSET }}
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install .NET SDK (required for WiX toolset)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest -Uri https://dot.net/v1/dotnet-install.ps1 -OutFile dotnet-install.ps1
+            .\dotnet-install.ps1 -Channel 8.0
+            $env:PATH = "$env:USERPROFILE\.dotnet;$env:USERPROFILE\.dotnet\tools;$env:PATH"
+            "$env:USERPROFILE\.dotnet" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } else {
+            Write-Output "dotnet already available — skipping install"
+          }
+
+      - name: Setup WiX
+        shell: pwsh
+        run: |
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+
+          if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
+            dotnet tool install --global wix --version 7.0.0
+          }
+
+          wix eula accept wix7
+
+          if (-not (wix extension list | Select-String "WixToolset.UI.wixext")) {
+            wix extension add WixToolset.UI.wixext
+          }
+
+      - name: Generate LICENSE.rtf from LICENSE
+        # The RTF shown on the WixUI license page is derived at build time —
+        # LICENSE stays the single source of truth; nothing generated is
+        # committed. (Pure text transform, no icon rendering involved.)
+        uses: ./.github/actions/generate-license-rtf
+
+      - name: Build MSI installer
+        id: package-msi
+        shell: pwsh
+        run: |
+          # wix is a global dotnet tool; make sure its directory is on PATH
+          # even if the Setup WiX step's PATH change didn't carry over.
+          $env:PATH = "$env:USERPROFILE\.dotnet\tools;" + $env:PATH
+          $v = "${{ steps.version.outputs.version }}"
+
+          # MSI ProductVersion must be major.minor.build — drop pre-release
+          # suffixes and any 4th segment (e.g. 0.2.1-hotfix.1 → 0.2.1).
+          $msiVersion = ($v -split '-')[0]
+          $parts = $msiVersion -split '\.'
+          if ($parts.Count -gt 3) { $msiVersion = ($parts[0..2] -join '.') }
+
+          $msi = "awara-$v-windows-x64.msi"
+          wix build resources/windows/awara.wxs -arch x64 -out $msi `
+            -d Version=$msiVersion `
+            -b target/release `
+            -b resources/windows `
+            -ext WixToolset.UI.wixext
+
+          if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+          }
+
+          echo "ASSET_MSI=$msi" >> $env:GITHUB_OUTPUT
+          echo "MSI built: $msi"
+
+      - name: Smoke test (MSI admin-extract)
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $msi = "awara-$v-windows-x64.msi"
+          $extractDir = "$env:TEMP\awara-msi-extract"
+
+          Write-Output "Admin-extracting $msi ..."
+          Remove-Item -Recurse -Force $extractDir -ErrorAction SilentlyContinue
+          Start-Process msiexec.exe `
+            -ArgumentList "/a `"$(Join-Path (Get-Location) $msi)`" /qn TARGETDIR=`"$extractDir`"" `
+            -Wait -NoNewWindow | Out-Null
+
+          $exe = Get-ChildItem -Path $extractDir -Recurse -Filter awara.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "MSI smoke test failed: awara.exe not found after admin-extract"
+            exit 1
+          }
+          Write-Output "  ✓ MSI contains $($exe.FullName)"
+          & $exe.FullName --version
+          if (-not $?) { throw "MSI smoke test failed: extracted awara.exe --version failed" }
+
+      - name: Publish MSI
+        uses: ./.github/actions/publish-release
+        with:
+          asset: ${{ steps.package-msi.outputs.ASSET_MSI }}
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Release: macOS ────────────────────────────────────────────────────────
+  macos-release:
+    needs: [check-version, linux-test, windows-test, macos-test, auto-tag]
+    if: needs.check-version.outputs.is_new == 'true'
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Get version
+        id: version
+        uses: ./.github/actions/extract-version
+
+      - name: Setup Rust
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --profile default
+          source "$HOME/.cargo/env"
+          rustup target add x86_64-apple-darwin
+          rustup target add aarch64-apple-darwin
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (x86_64 + aarch64)
+        run: |
+          cargo build --release --locked \
+            --target x86_64-apple-darwin
+          cargo build --release --locked \
+            --target aarch64-apple-darwin
+
+      - name: Package universal DMG
+        id: package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BUNDLE="Awara.app"
+          CONTENTS="$BUNDLE/Contents"
+          MACOS_DIR="$CONTENTS/MacOS"
+          RESOURCES="$CONTENTS/Resources"
+
+          # Merge both arch binaries into a single universal (fat) binary
+          mkdir -p "$MACOS_DIR" "$RESOURCES"
+          lipo -create \
+            target/x86_64-apple-darwin/release/awara \
+            target/aarch64-apple-darwin/release/awara \
+            -output "$MACOS_DIR/awara"
+
+          cp resources/macos/Info.plist "$CONTENTS/Info.plist"
+          cp resources/macos/awara.icns   "$RESOURCES/awara.icns"
+
+          # Stamp the release version into the bundle plist — the committed
+          # plist is a template and would otherwise ship stale in Finder's
+          # Get Info.
+          plutil -replace CFBundleShortVersionString -string "$VERSION" "$CONTENTS/Info.plist"
+          plutil -replace CFBundleVersion -string "$VERSION" "$CONTENTS/Info.plist"
+
+          # Ad-hoc sign
+          codesign --force --deep --sign - "$BUNDLE" 2>&1 || echo "  ⚠ codesign warning: $?"
+
+          # Staging folder: .app + /Applications drag-target symlink
+          DMG_STAGING="dmg-staging"
+          rm -rf "$DMG_STAGING"
+          mkdir "$DMG_STAGING"
+          cp -R "$BUNDLE" "$DMG_STAGING/"
+          ln -s /Applications "$DMG_STAGING/Applications"
+
+          DMG="awara-$VERSION-macos-universal.dmg"
+          VOLNAME="Awara"
+
+          hdiutil create \
+            -volname "$VOLNAME" \
+            -srcfolder "$DMG_STAGING" \
+            -ov \
+            -format UDRW \
+            "$DMG.rw.dmg"
+
+          # Convert to read-only compressed DMG
+          hdiutil convert \
+            "$DMG.rw.dmg" \
+            -format UDZO \
+            -ov \
+            -o "$DMG"
+
+          rm -f "$DMG.rw.dmg"
+          rm -rf "$DMG_STAGING"
+
+          echo "DMG=$DMG" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (universal DMG)
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DMG="awara-$VERSION-macos-universal.dmg"
+          echo "=== Testing $DMG ==="
+
+          # Use an explicit mountpoint with no spaces so we don't have to parse
+          # the hdiutil output (volume name "Awara" has spaces
+          # that break awk '{print $NF}').
+          MOUNTDIR="/Volumes/awara-test-$$"
+          if ! hdiutil attach "$DMG" -nobrowse -noverify -noautoopen -mountpoint "$MOUNTDIR" 2>&1; then
+            echo "FAIL: could not mount $DMG"
+            exit 1
+          fi
+          mountpoint="$MOUNTDIR"
+
+          APP="$mountpoint/Awara.app"
+          BIN="$APP/Contents/MacOS/awara"
+
+          test -d "$APP" || { hdiutil detach "$mountpoint" 2>/dev/null; echo "FAIL: .app missing"; exit 1; }
+          test -f "$BIN" || { hdiutil detach "$mountpoint" 2>/dev/null; echo "FAIL: binary missing"; exit 1; }
+          test -L "$mountpoint/Applications" || { hdiutil detach "$mountpoint" 2>/dev/null; echo "FAIL: /Applications symlink missing"; exit 1; }
+
+          echo "  ✓ .app present"
+          echo "  ✓ /Applications symlink present"
+
+          # Verify lipo produced a true universal binary
+          file "$BIN" | grep -q "universal binary" \
+            || { hdiutil detach "$mountpoint" 2>/dev/null; echo "FAIL: not a universal binary"; exit 1; }
+          echo "  ✓ universal binary (x86_64 + arm64) confirmed"
+
+          # Verify the release version was stamped into the bundle plist
+          # (the committed plist is a placeholder — version comes only from Cargo.toml)
+          PLIST_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || echo "")
+          if [ "$PLIST_VERSION" != "$VERSION" ]; then
+            hdiutil detach "$mountpoint" 2>/dev/null
+            echo "FAIL: bundle version $PLIST_VERSION != expected $VERSION"
+            exit 1
+          fi
+          echo "  ✓ bundle version $PLIST_VERSION"
+
+          "$BIN" --version || { hdiutil detach "$mountpoint" 2>/dev/null; echo "FAIL: --version failed"; exit 1; }
+          echo "  ✓ launch passed"
+
+          hdiutil detach "$mountpoint" 2>/dev/null
+          echo "  ✓ universal DMG passed"
+
+      - name: Publish universal DMG
+        uses: ./.github/actions/publish-release
+        with:
+          asset: ${{ steps.package.outputs.DMG }}
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}

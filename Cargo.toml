@@ -1,0 +1,49 @@
+[package]
+name = "awara"
+version = "0.9.6"
+edition = "2024"
+authors = ["Matthew Deik"]
+description = "Batch file renamer with GUI, TUI, and CLI"
+license = "AGPL-3.0-only"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+regex = "1.10"
+rayon = "1.8"
+glob = "0.3"
+uuid = { version = "1.4", features = ["v4"] }
+walkdir = "2.4"
+unicode-normalization = "0.1.25"
+ratatui = "0.29.0"
+crossterm = "0.29.0"
+dirs = "6.0.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+filetime = "0.2"
+exif = { version = "0.5", package = "kamadak-exif" }
+libc = "0.2"
+trash = "5"
+ctrlc = "3.4"
+
+# GUI dependencies (optional, enabled by default via `gui` feature)
+eframe = { version = "0.36", optional = true }
+egui = { version = "0.36", optional = true }
+rfd = { version = "0.15", optional = true }
+
+[features]
+default = ["gui"]
+gui = ["eframe", "egui", "rfd"]
+
+[build-dependencies]
+usvg = "0.44"
+tiny-skia = "0.11"
+resvg = "0.44"
+
+# Windows-specific build deps for embedding the .exe icon
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
+[dev-dependencies]
+tempfile = "3.8"
+assert_cmd = "2.0"
+predicates = "3.0"

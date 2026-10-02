@@ -1,0 +1,18 @@
+[Desktop Entry]
+Name=Awara
+GenericName=Batch file renamer
+Keywords=Batch Rename;Batch Renamer;File Rename;File Renamer;Rename Files;Mass Rename;Bulk Rename Utility;Rename Utility;
+Comment=Batch file renamer with TUI and optional GUI
+Exec=awara --gui %F
+Icon=awara
+StartupWMClass=awara
+Type=Application
+Categories=Utility;FileTools;
+Terminal=false
+StartupNotify=true
+MimeType=inode/directory;
+Actions=RenameWithAwara;
+
+[Desktop Action RenameWithAwara]
+Name=Rename with Awara
+Exec=awara --gui %F

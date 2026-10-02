@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+    Name="Awara"
+    Manufacturer="Matthew Deik"
+    Version="$(var.Version)"
+    UpgradeCode="6A2B3C4D-5E6F-7890-ABCD-EF1234567890"
+    Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Awara is already installed." />
+
+    <!-- Icon for Add/Remove Programs display -->
+    <Icon Id="awaraIcon" SourceFile="awara.ico" />
+    <Property Id="ARPPRODUCTICON" Value="awaraIcon" />
+
+    <!-- ARP metadata -->
+    <Property Id="ARPCOMMENTS" Value="Batch file renamer with GUI, TUI, and CLI" />
+    <Property Id="ARPCONTACT" Value="Matthew Deik" />
+    <Property Id="ARPDISPLAYNAME" Value="Awara" />
+
+    <!-- License RTF for the WixUI LicenseAgreementDlg -->
+    <WixVariable Id="WixUILicenseRtf" Value="LICENSE.rtf" />
+
+    <Media Id="1" Cabinet="awara.cab" EmbedCab="yes" />
+
+    <!-- Install directory
+         Nested under ProgramFiles64Folder for the default; WixUI_InstallDirExtended's
+         InstallDirDlg lets the user type or browse to any path.                       -->
+    <!-- scope=perMachine is required for context-menu shell integration (HKLM).       -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="!(bind.Property.ApplicationFolderName)">
+        <Component Id="awaraBinary" Guid="A1B2C3D4-E5F6-7890-ABCD-EF1234567890">
+          <File Id="awaraExe" Name="awara.exe" Source="awara.exe" KeyPath="yes" />
+        </Component>
+
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Start Menu shortcut (per-machine, so uses HKLM for the key path) -->
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Awara">
+        <Component Id="StartMenuShortcut" Guid="B2C3D4E5-F6A7-8901-BCDE-F12345678901">
+          <Shortcut Id="AppStartMenuShortcut"
+                    Name="Awara"
+                    Description="Batch file renamer with TUI and optional GUI"
+                    Target="[INSTALLDIR]awara.exe"
+                    WorkingDirectory="INSTALLDIR"
+                    Advertise="no" />
+          <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue Root="HKLM" Key="Software\mdeik\Awara" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Desktop shortcut (optional; installed only if user opts in via feature tree) -->
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="F0A1B2C3-D4E5-6789-ABCD-EF0123456789">
+        <Shortcut Id="AppDesktopShortcut"
+                  Name="Awara"
+                  Description="Batch file renamer with TUI and optional GUI"
+                  Target="[INSTALLDIR]awara.exe"
+                  WorkingDirectory="INSTALLDIR"
+                  Advertise="no" />
+        <RegistryValue Root="HKLM" Key="Software\mdeik\Awara" Name="DesktopShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <!-- Context Menu Registration
+         Verbs: on a directory, in directory background.
+         Registry keys are written under HKLM\Software\Classes (modern MSI practice)
+         rather than directly to HKCR (a merged view of HKLM + HKCU). -->
+
+    <!-- Case 1: Right-click on a directory - open awara showing that directory -->
+    <Component Id="ContextMenuDirectory" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
+      <RegistryKey Root="HKLM" Key="Software\Classes\Directory\shell\RenameWithAwara">
+        <RegistryValue Type="string" Value="Rename with Awara" KeyPath="yes" />
+        <RegistryValue Type="string" Name="MUIVerb" Value="Rename with Awara" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLDIR]awara.exe" />
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="Software\Classes\Directory\shell\RenameWithAwara\command">
+        <RegistryValue Type="string" Value="&quot;[INSTALLDIR]awara.exe&quot; --gui &quot;%1&quot;" />
+      </RegistryKey>
+    </Component>
+
+    <!-- Case 2: Right-click in directory background - open awara showing that directory -->
+    <Component Id="ContextMenuBackground" Guid="D4E5F6A7-B8C9-0123-DEF0-123456789012">
+      <RegistryKey Root="HKLM" Key="Software\Classes\Directory\Background\shell\RenameWithAwara">
+        <RegistryValue Type="string" Value="Rename with Awara" KeyPath="yes" />
+        <RegistryValue Type="string" Name="MUIVerb" Value="Rename with Awara" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLDIR]awara.exe" />
+      </RegistryKey>
+      <RegistryKey Root="HKLM" Key="Software\Classes\Directory\Background\shell\RenameWithAwara\command">
+        <RegistryValue Type="string" Value="&quot;[INSTALLDIR]awara.exe&quot; --gui &quot;%V&quot;" />
+      </RegistryKey>
+    </Component>
+
+
+
+
+    <!-- Features
+         "ProductFeature"         - always installed: awara binary.
+         "StartMenuFeature"       - default installed: Start Menu shortcut; user can uncheck.
+         "ShellIntegrationFeature" - default installed: context menu entries + launcher; user can uncheck.
+         "DesktopShortcutFeature"  - optional (default off): desktop shortcut.              -->
+
+    <Feature Id="ProductFeature" Title="Awara" Level="1"
+             Description="The Awara binary." Display="hidden">
+      <ComponentRef Id="awaraBinary" />
+    </Feature>
+
+    <Feature Id="StartMenuFeature" Title="Start Menu Shortcut" Level="1"
+             Description="Add a Awara entry to the Start Menu.">
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <Feature Id="ShellIntegrationFeature" Title="Shell Integration" Level="1"
+             Description="Add 'Rename with Awara' to the right-click menu for directories and folder backgrounds.">
+      <ComponentRef Id="ContextMenuDirectory" />
+      <ComponentRef Id="ContextMenuBackground" />
+    </Feature>
+
+    <Feature Id="DesktopShortcutFeature" Title="Desktop Shortcut" Level="2"
+             Description="Place a shortcut to Awara on your desktop.">
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <!-- UI
+         WixUI_InstallDir: Welcome → InstallDir → VerifyReady → Progress → Exit.
+         All Level=1 features (Start Menu, Shell Integration) install by default.
+         DesktopShortcutFeature (Level=2) is not shown and not installed.
+         ProductFeature is hidden (always installed).                                    -->
+    <Property Id="ApplicationFolderName" Value="Awara" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLDIR" />
+
+    <ui:WixUI Id="WixUI_InstallDir" />
+
+  </Package>
+</Wix>

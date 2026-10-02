@@ -1,0 +1,39 @@
+# Repo-local PKGBUILD for Arch-based distros (Arch, CachyOS, EndeavourOS, ...).
+#
+# Design notes (single source of truth):
+#   - pkgver is parsed from the repo's Cargo.toml at build time — the version
+#     is only ever edited in one place, and `makepkg -si` picks it up.
+#   - The package is built from the LOCAL checkout (no network, no git clone),
+#     so uncommitted changes are included too.
+#   - The desktop entry and icon are taken from resources/, keeping this
+#     package in sync with the .deb/.rpm/AppImage outputs.
+#
+# Install/update:  makepkg -si   (run from this directory)
+# Uninstall:       pacman -R awara
+
+pkgname=awara
+# Resolve the repo root from this file's location: <repo>/packaging/arch/PKGBUILD
+_repo_root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+
+pkgver="$(grep -m1 '^version = ' "$_repo_root/Cargo.toml" | cut -d'"' -f2 | tr '-' '_')"
+pkgrel=1
+install=awara.install
+pkgdesc="Batch file renamer with GUI, TUI, and CLI"
+arch=('x86_64')
+url="https://github.com/mdeik/Awara"
+license=('AGPL-3.0-only')
+depends=('libxkbcommon' 'wayland' 'libxcb' 'libglvnd')
+makedepends=('rust' 'pkgconf' 'wayland' 'libxkbcommon' 'libxcb')
+source=()
+sha256sums=()
+
+build() {
+  cargo build --release --locked --manifest-path "$_repo_root/Cargo.toml"
+}
+
+package() {
+  install -Dm755 "$_repo_root/target/release/awara" "$pkgdir/usr/bin/awara"
+  install -Dm644 "$_repo_root/resources/linux/awara.desktop" "$pkgdir/usr/share/applications/awara.desktop"
+  install -Dm644 "$_repo_root/resources/icons/awara.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/awara.svg"
+  install -Dm644 "$_repo_root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

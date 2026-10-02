@@ -1,0 +1,6 @@
+/target
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.pkg.tar.zst
+to-do.md
+scripts/__pycache__/generate_icons.cpython-314.pyc

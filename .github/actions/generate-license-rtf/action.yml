@@ -1,0 +1,7 @@
+name: Generate LICENSE.rtf
+description: Generates resources/windows/LICENSE.rtf from LICENSE (Markdown-to-RTF) for the MSI license page. LICENSE stays the single source of truth; nothing generated is committed. Pure text transform (no System.Drawing).
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      run: pwsh -NoProfile -ExecutionPolicy Bypass -File "${{ github.action_path }}/generate-license-rtf.ps1"
